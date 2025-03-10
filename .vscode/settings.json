@@ -1,0 +1,6 @@
+{
+   "workbench.preferredDarkColorTheme": "Cursor Dark High Contrast",
+   "workbench.view.alwaysShowHeaderActions": true,
+   "jupyter.themeMatplotlibPlots": true,
+   "material-icon-theme.enableLogging": true
+}

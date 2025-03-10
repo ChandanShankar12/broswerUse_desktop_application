@@ -1,0 +1,66 @@
+{
+  "name": "browser-use-electron",
+  "version": "1.0.0",
+  "description": "Electron application with Next.js frontend and Python backend",
+  "main": "src/main/main.js",
+  "scripts": {
+    "dev": "next dev -p 3001 src/renderer",
+    "electron": "cross-env NODE_ENV=development electron .",
+    "build": "next build src/renderer",
+    "start": "concurrently \"npm run dev\" \"npm run electron\"",
+    "package": "electron-builder",
+    "clean": "powershell -File ./clean.ps1",
+    "test": "powershell -File ./test.ps1",
+    "setup": "powershell -File ./setup.ps1",
+    "postinstall": "node postbuild.js"
+  },
+  "dependencies": {
+    "cross-spawn": "^7.0.3",
+    "electron-serve": "^1.1.0",
+    "python-shell": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.15.11",
+    "@types/react": "^18.0.37",
+    "autoprefixer": "^10.4.14",
+    "concurrently": "^8.0.1",
+    "cross-env": "^7.0.3",
+    "electron": "^24.8.0",
+    "electron-builder": "^24.6.3",
+    "next": "^13.4.19",
+    "postcss": "^8.4.24",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "rimraf": "^5.0.0",
+    "tailwindcss": "^3.3.2",
+    "typescript": "^5.0.4"
+  },
+  "build": {
+    "appId": "com.browser-use.app",
+    "productName": "Browser Use Electron",
+    "files": [
+      "src/**/*",
+      "!src/renderer/.next/cache/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "src/python",
+        "to": "python",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}
