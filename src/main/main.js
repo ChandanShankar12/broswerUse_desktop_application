@@ -52,7 +52,7 @@ function startPythonApi() {
   // Options for the Python shell
   const options = {
     mode: 'text',
-    pythonPath: process.platform === 'win32' ? 'python' : 'python3', // Better cross-platform support
+    pythonPath: process.platform === 'win32' ? 'C:\\Users\\PC\\AppData\\Local\\Programs\\Python\\Python313\\python.exe' : 'python3', // Use full path to system Python
     pythonOptions: ['-u'], // unbuffered output
     scriptPath: pythonPath,
     args: ['--electron'] // Add the --electron flag
