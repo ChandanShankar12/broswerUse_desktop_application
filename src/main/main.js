@@ -4,6 +4,7 @@ const serve = require('electron-serve');
 const { spawn } = require('cross-spawn');
 const { join } = require('path');
 const { PythonShell } = require('python-shell');
+const http = require('http');
 
 // Serve the Next.js app
 const serveURL = serve({ directory: join(__dirname, '../../src/renderer/.next') });
@@ -74,30 +75,34 @@ function startPythonApi() {
 
   // Handle Python script output
   pythonProcess.on('message', message => {
-    console.log('Python message:', message);
+    console.log('Python message received');
     if (mainWindow) {
       try {
         // Check if the message is a JSON string
-        if (message && message.trim().startsWith('{') && message.trim().endsWith('}')) {
+        if (message && typeof message === 'string' && 
+            message.trim().startsWith('{') && message.trim().endsWith('}')) {
           // Try to parse the message if it's JSON
           const parsedMessage = JSON.parse(message);
           mainWindow.webContents.send('python-message', parsedMessage);
+        } else if (message && typeof message === 'string' && 
+                  message.trim().startsWith('[') && message.trim().endsWith(']')) {
+          // Handle JSON arrays as well
+          const parsedMessage = JSON.parse(message);
+          mainWindow.webContents.send('python-message', parsedMessage);
         } else {
-          // Log non-JSON output but don't try to parse it
-          console.log('Non-JSON output from Python:', message);
+          // For non-JSON output, only log to console, don't send to renderer
+          // This reduces noise in the renderer process
+          console.log('Python non-JSON output:', message);
           
           // Send as error message if it looks like an error
           if (message.includes('Error') || message.includes('Exception') || message.includes('Traceback')) {
             mainWindow.webContents.send('python-error', message);
-          } else {
-            // Otherwise send as regular message
-            mainWindow.webContents.send('python-message', message);
           }
         }
       } catch (err) {
-        // If JSON parsing fails, send as is
+        // If JSON parsing fails, only log to console
         console.error('Error parsing Python message:', err);
-        mainWindow.webContents.send('python-message', message);
+        console.log('Message that caused error:', message);
       }
     }
   });
@@ -195,6 +200,11 @@ ipcMain.handle('run-agent', async (event, data) => {
     }
   }
 
+  // Check if we need to launch the browser
+  if (data && data.use_own_browser) {
+    await launchChromeWithDebugging();
+  }
+
   // Forward the request to Python API and return the response
   return new Promise((resolve, reject) => {
     if (!pythonProcess) {
@@ -234,6 +244,95 @@ ipcMain.handle('run-agent', async (event, data) => {
     }, 60000); // 60 second timeout
   });
 });
+
+// Function to launch Chrome with remote debugging enabled
+async function launchChromeWithDebugging() {
+  const { spawn } = require('cross-spawn');
+  const http = require('http');
+  const chromePath = process.platform === 'win32' ? 
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' : 
+    (process.platform === 'darwin' ? 
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 
+      '/usr/bin/google-chrome');
+  
+  console.log(`Checking if Chrome with debugging is already running...`);
+  
+  // Check if Chrome is already running with debugging port open
+  const isDebugPortOpen = await new Promise((resolve) => {
+    const req = http.get('http://localhost:9222/json/version', (res) => {
+      if (res.statusCode === 200) {
+        console.log('Chrome with debugging already running');
+        resolve(true);
+      } else {
+        resolve(false);
+      }
+    });
+    
+    req.on('error', () => {
+      console.log('No Chrome instance with debugging detected');
+      resolve(false);
+    });
+    
+    req.setTimeout(2000, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+  
+  // If Chrome with debugging is already running, don't start a new one
+  if (isDebugPortOpen) {
+    console.log('Using existing Chrome instance with debugging enabled');
+    return;
+  }
+  
+  console.log(`Launching Chrome for debugging from path: ${chromePath}`);
+  
+  // Kill any existing Chrome instances that might interfere
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/F', '/IM', 'chrome.exe'], { shell: true });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } else {
+      spawn('pkill', ['-f', 'chrome.*remote-debugging-port'], { shell: true });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  } catch (error) {
+    console.log('No existing Chrome instances to kill or error killing Chrome:', error);
+  }
+  
+  // Launch Chrome with debugging enabled
+  const args = [
+    '--remote-debugging-port=9222',
+    '--remote-debugging-address=0.0.0.0',  // Allow remote connections
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    '--disable-popup-blocking',
+    '--disable-sync',
+    '--start-maximized', // Start maximized
+    '--force-device-scale-factor=0.75', // Set zoom level to 75%
+    '--window-size=1280,720',
+    'about:blank'  // Start with a blank page
+  ];
+  
+  // For Windows, try to maximize window explicitly
+  if (process.platform === 'win32') {
+    args.push('--start-fullscreen'); // For Windows, add fullscreen parameter
+  }
+  
+  const chromeProcess = spawn(chromePath, args, {
+    detached: true,
+    stdio: 'ignore'
+  });
+  
+  // Don't wait for the Chrome process
+  chromeProcess.unref();
+  
+  // Wait a bit for Chrome to initialize
+  console.log('Waiting for Chrome to initialize...');
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  console.log('Chrome should be ready now');
+}
 
 // IPC handler for stopping the agent
 ipcMain.handle('stop-agent', async (event) => {

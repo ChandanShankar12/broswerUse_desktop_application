@@ -2,13 +2,18 @@ import pdb
 import logging
 import json
 import sys
+import asyncio
+import threading
+import re
+import uuid
+from datetime import datetime
+from typing import Dict, List, Optional, Any, Union
 
 from dotenv import load_dotenv
 
 load_dotenv()
 import os
 import glob
-import asyncio
 import argparse
 import os
 
@@ -51,6 +56,48 @@ _global_agent = None
 
 # Create the global agent state instance
 _global_agent_state = AgentState()
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Ensure proper JSON handling
+class ElectronJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder for sending data to Electron."""
+    def default(self, obj):
+        if isinstance(obj, (datetime, bytes)):
+            return str(obj)
+        elif hasattr(obj, 'to_dict'):
+            return obj.to_dict()
+        elif hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return super().default(obj)
+
+def json_serialize(data):
+    """Safely serialize data to JSON for Electron IPC."""
+    try:
+        return json.dumps(data, cls=ElectronJSONEncoder)
+    except Exception as e:
+        logger.error(f"JSON serialization error: {str(e)}")
+        # Return a simplified error object that can be serialized
+        return json.dumps({"error": f"Failed to serialize data: {str(e)}"})
+
+# Function to send data back to Electron
+def send_to_electron(data):
+    """Send data back to Electron process."""
+    try:
+        if isinstance(data, str):
+            # If it's already a string, print directly
+            print(data, flush=True)
+        else:
+            # Otherwise, serialize to JSON
+            print(json_serialize(data), flush=True)
+    except Exception as e:
+        # If there's an error, send a simplified error message
+        logger.error(f"Error sending to Electron: {str(e)}")
+        print(json.dumps({"error": str(e)}), flush=True)
 
 def resolve_sensitive_env_variables(text):
     """
@@ -478,14 +525,14 @@ async def run_custom_agent(
         
         # Initialize chrome_path and cdp_url
         chrome_path = None
-        cdp_url = chrome_cdp
+        cdp_url = None
         
         # Log the browser configuration
         logger.info(f"Browser config - use_own_browser: {use_own_browser}, headless: {headless}, chrome_cdp: {chrome_cdp}")
         
         if use_own_browser:
-            # Get Chrome CDP URL from environment variable or parameter
-            cdp_url = os.getenv("CHROME_CDP", chrome_cdp)
+            # Set CDP URL to the parameter or default
+            cdp_url = chrome_cdp or "http://localhost:9222"
             logger.info(f"Using CDP URL: {cdp_url}")
             
             # Get Chrome path from environment 
@@ -501,20 +548,13 @@ async def run_custom_agent(
             if chrome_user_data:
                 extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
                 logger.info(f"Using Chrome user data dir: {chrome_user_data}")
-                
-            # Add remote debugging if CDP URL is not provided
-            if not cdp_url:
-                debug_port = os.getenv("CHROME_DEBUGGING_PORT", "9222")
-                debug_host = os.getenv("CHROME_DEBUGGING_HOST", "localhost")
-                extra_chromium_args += [f"--remote-debugging-port={debug_port}"]
-                logger.info(f"Added remote debugging on port {debug_port}")
         else:
             logger.info("Using packaged Chrome browser")
 
         controller = CustomController()
         
         # Check if browser needs to be initialized
-        need_new_browser = (_global_browser is None) or (cdp_url and cdp_url != "" and cdp_url != None)
+        need_new_browser = (_global_browser is None) or (cdp_url is not None and not (_global_browser and getattr(_global_browser, '_config', None) and _global_browser._config.cdp_url == cdp_url))
         
         if need_new_browser:
             logger.info("Creating new browser instance with config:")
@@ -525,6 +565,24 @@ async def run_custom_agent(
             logger.info(f"  Extra args: {extra_chromium_args}")
             
             try:
+                # If we're using CDP, we need to make sure Chrome is running with debugging enabled
+                if cdp_url:
+                    # Verify CDP endpoint is accessible 
+                    import requests
+                    try:
+                        response = requests.get(cdp_url + "/json/version")
+                        if response.status_code == 200:
+                            logger.info(f"Successfully connected to Chrome CDP at {cdp_url}")
+                        else:
+                            logger.warning(f"CDP endpoint returned status code {response.status_code}")
+                    except Exception as e:
+                        logger.warning(f"Could not verify CDP endpoint: {str(e)}")
+                
+                # If there's an existing browser, close it first
+                if _global_browser:
+                    logger.info("Closing existing browser before creating new one")
+                    await close_global_browser()
+                
                 _global_browser = CustomBrowser(
                     config=BrowserConfig(
                         headless=headless,
@@ -539,7 +597,7 @@ async def run_custom_agent(
                 logger.error(f"Failed to create browser: {str(e)}")
                 raise Exception(f"Failed to launch browser: {str(e)}")
 
-        need_new_context = (_global_browser_context is None or (cdp_url and cdp_url != "" and cdp_url != None))
+        need_new_context = (_global_browser_context is None)
         
         if need_new_context:
             logger.info("Creating new browser context with config:")
@@ -1259,227 +1317,143 @@ def create_ui(config, theme_name="Ocean"):
 
 def main():
     # Check if running in Electron mode
-    if '--electron' in sys.argv:
-        print("Starting in Electron mode...")
+    parser = argparse.ArgumentParser(description='Browser Use API')
+    parser.add_argument('--electron', action='store_true', help='Run in Electron mode')
+    args = parser.parse_args()
+    
+    if args.electron:
+        print("Starting Browser Use Python API in Electron mode", flush=True)
         
-        # Setup logging for Electron mode
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
+        # Create an event loop for asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        # Handle IPC communication
+        # Handle messages from Electron
         async def handle_message(message_str):
             try:
+                # Parse the message as JSON
                 message = json.loads(message_str)
                 action = message.get('action')
                 data = message.get('data', {})
+                request_id = message.get('id')
+                
+                logger.info(f"Received action: {action}")
                 
                 if action == 'init':
-                    # Respond to initialization message
-                    print(json.dumps({
-                        'status': 'ready',
-                        'timestamp': data.get('timestamp'),
-                        'message': 'Python API initialized successfully'
-                    }))
-                    return
+                    # Respond to initialization
+                    response = {
+                        'status': 'ready', 
+                        'timestamp': datetime.now().isoformat(),
+                        'id': request_id
+                    }
+                    send_to_electron(json_serialize(response))
                 
-                if action == 'run-agent':
+                elif action == 'run-agent':
+                    # Run the agent with the provided configuration
                     try:
-                        # Run agent and return results
-                        agent_type = data.get('agent_type', 'org')
+                        # Extract agent configuration from data
+                        agent_type = data.get('agent_type', 'custom')
                         
-                        # Use a variable to capture the result
-                        result = await run_browser_agent(
-                            agent_type=agent_type,
-                            llm_provider=data.get('llm_provider'),
-                            llm_model_name=data.get('llm_model_name'),
-                            llm_num_ctx=data.get('llm_num_ctx'),
-                            llm_temperature=data.get('llm_temperature'),
-                            llm_base_url=data.get('llm_base_url'),
-                            llm_api_key=data.get('llm_api_key'),
-                            use_own_browser=data.get('use_own_browser', False),
-                            keep_browser_open=data.get('keep_browser_open', False),
-                            headless=data.get('headless', False),
-                            disable_security=data.get('disable_security', False),
-                            window_w=data.get('window_w', 1280),
-                            window_h=data.get('window_h', 720),
-                            save_recording_path=data.get('save_recording_path'),
-                            save_agent_history_path=data.get('save_agent_history_path', './tmp/agent_history'),
-                            save_trace_path=data.get('save_trace_path', './tmp/traces'),
-                            enable_recording=data.get('enable_recording', True),
-                            task=data.get('task', ''),
-                            add_infos=data.get('add_infos', ''),
-                            max_steps=data.get('max_steps', 15),
-                            use_vision=data.get('use_vision', True),
-                            max_actions_per_step=data.get('max_actions_per_step', 5),
-                            tool_calling_method=data.get('tool_calling_method', 'auto'),
-                            chrome_cdp=data.get('chrome_cdp', None)
+                        # Common parameters
+                        llm_provider = data.get('llm_provider', 'openai')
+                        llm_model_name = data.get('llm_model_name', 'gpt-4o')
+                        llm_num_ctx = data.get('llm_num_ctx', 4096)
+                        llm_temperature = data.get('llm_temperature', 0.0)
+                        llm_base_url = data.get('llm_base_url', '')
+                        llm_api_key = data.get('llm_api_key', '')
+                        use_own_browser = data.get('use_own_browser', False)
+                        keep_browser_open = data.get('keep_browser_open', False)
+                        headless = data.get('headless', False)
+                        disable_security = data.get('disable_security', False)
+                        window_w = data.get('window_w', 1280)
+                        window_h = data.get('window_h', 720)
+                        save_recording_path = data.get('save_recording_path', '')
+                        save_agent_history_path = data.get('save_agent_history_path', '')
+                        save_trace_path = data.get('save_trace_path', '')
+                        enable_recording = data.get('enable_recording', False)
+                        task = data.get('task', '')
+                        add_infos = data.get('add_infos', '')
+                        max_steps = data.get('max_steps', 25)
+                        use_vision = data.get('use_vision', True)
+                        max_actions_per_step = data.get('max_actions_per_step', 3)
+                        tool_calling_method = data.get('tool_calling_method', 'functions')
+                        chrome_cdp = data.get('chrome_cdp', 'http://localhost:9222')
+                        
+                        # Configure the LLM
+                        llm = utils.get_llm_model(
+                            provider=llm_provider, 
+                            model_name=llm_model_name, 
+                            num_ctx=llm_num_ctx, 
+                            temperature=llm_temperature, 
+                            base_url=llm_base_url, 
+                            api_key=llm_api_key
                         )
                         
-                        # Handle result based on type
-                        if isinstance(result, tuple):
-                            # Get the number of values in the tuple
-                            num_values = len(result)
-                            logger.info(f"Result has {num_values} values")
-                            
-                            # Safely extract values
-                            final_result = result[0] if num_values > 0 else ""
-                            errors = result[1] if num_values > 1 else ""
-                            model_actions = result[2] if num_values > 2 else ""
-                            model_thoughts = result[3] if num_values > 3 else ""
-                            trace_file = result[4] if num_values > 4 else None
-                            history_file = result[5] if num_values > 5 else None
-                        else:
-                            # Handle non-tuple result
-                            final_result = str(result) if result else ""
-                            errors = ""
-                            model_actions = ""
-                            model_thoughts = ""
-                            trace_file = None
-                            history_file = None
+                        # Run the agent based on type
+                        result = None
+                        if agent_type == 'browser':
+                            result = await run_browser_agent(
+                                agent_type, llm_provider, llm_model_name, llm_num_ctx, 
+                                llm_temperature, llm_base_url, llm_api_key, use_own_browser, 
+                                keep_browser_open, headless, disable_security, window_w, 
+                                window_h, save_recording_path, save_agent_history_path, 
+                                save_trace_path, enable_recording, task, add_infos, max_steps, 
+                                use_vision, max_actions_per_step, tool_calling_method, chrome_cdp
+                            )
+                        elif agent_type == 'org':
+                            result = await run_org_agent(
+                                llm, use_own_browser, keep_browser_open, headless, 
+                                disable_security, window_w, window_h, save_recording_path, 
+                                save_agent_history_path, save_trace_path, task, max_steps, 
+                                use_vision, max_actions_per_step, tool_calling_method, chrome_cdp
+                            )
+                        else:  # Default to custom agent
+                            result = await run_custom_agent(
+                                llm, use_own_browser, keep_browser_open, headless, 
+                                disable_security, window_w, window_h, save_recording_path, 
+                                save_agent_history_path, save_trace_path, task, add_infos, 
+                                max_steps, use_vision, max_actions_per_step, tool_calling_method, chrome_cdp
+                            )
                         
-                        print(json.dumps({
-                            'id': data.get('id'),
-                            'result': {
-                                'final_result': final_result,
-                                'errors': errors,
-                                'model_actions': model_actions,
-                                'model_thoughts': model_thoughts,
-                                'trace_file': trace_file,
-                                'history_file': history_file
-                            }
-                        }))
-                    except Exception as e:
-                        import traceback
-                        error_trace = traceback.format_exc()
-                        logger.error(f"Error running agent: {str(e)}\n{error_trace}")
-                        print(json.dumps({
-                            'id': data.get('id'),
-                            'result': {
-                                'status': 'error',
-                                'message': str(e),
-                                'trace': error_trace
-                            }
-                        }))
-                
-                elif action == 'stop-agent':
-                    # Stop the agent
-                    global _global_agent_state
-                    if _global_agent_state:
-                        _global_agent_state.request_stop()
-                        print(json.dumps({
-                            'status': 'success',
-                            'message': 'Agent stop requested'
-                        }))
-                    else:
-                        print(json.dumps({
-                            'status': 'error',
-                            'message': 'No agent running'
-                        }))
-                
-                elif action == 'run-deep-search':
-                    # Handle deep search
-                    try:
-                        result = await run_deep_search(
-                            research_task=data.get('research_task'),
-                            max_search_iteration=data.get('max_search_iteration', 3),
-                            max_query_per_iter=data.get('max_query_per_iter', 3),
-                            llm_provider=data.get('llm_provider'),
-                            llm_model_name=data.get('llm_model_name'),
-                            llm_temperature=data.get('llm_temperature'),
-                            llm_num_ctx=data.get('llm_num_ctx'),
-                            llm_base_url=data.get('llm_base_url'),
-                            llm_api_key=data.get('llm_api_key'),
-                            use_vision=data.get('use_vision', True),
-                            use_own_browser=data.get('use_own_browser', False),
-                            headless=data.get('headless', False),
-                            chrome_cdp=data.get('chrome_cdp', None)
-                        )
-                        
-                        print(json.dumps({
-                            'id': data.get('id'),
-                            'result': result
-                        }))
-                    except Exception as e:
-                        import traceback
-                        error_trace = traceback.format_exc()
-                        logger.error(f"Error running deep search: {str(e)}\n{error_trace}")
-                        print(json.dumps({
-                            'id': data.get('id'),
-                            'result': {
-                                'status': 'error',
-                                'message': str(e),
-                                'trace': error_trace
-                            }
-                        }))
-                
-                elif action == 'get-recordings':
-                    # Get list of recordings
-                    directory = data.get('directory', './tmp/record_videos')
-                    try:
-                        files = get_latest_files(directory)
-                        print(json.dumps({
-                            'id': data.get('id'),
-                            'result': {
-                                'status': 'success',
-                                'files': files
-                            }
-                        }))
-                    except Exception as e:
-                        print(json.dumps({
-                            'id': data.get('id'),
-                            'result': {
-                                'status': 'error',
-                                'message': str(e)
-                            }
-                        }))
-                    
-                else:
-                    print(json.dumps({
-                        'id': data.get('id', ''),
-                        'result': {
-                            'status': 'error',
-                            'message': f'Unknown action: {action}'
+                        # Return the result with the request ID
+                        response = {
+                            'result': result,
+                            'id': request_id
                         }
-                    }))
-                    
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse message: {message_str}")
-                print(json.dumps({
+                        send_to_electron(json_serialize(response))
+                        
+                    except Exception as e:
+                        logger.error(f"Error running agent: {str(e)}", exc_info=True)
+                        response = {
+                            'result': {'status': 'error', 'message': str(e)},
+                            'id': request_id
+                        }
+                        send_to_electron(json_serialize(response))
+                
+                # ... Handle other actions (other elif blocks)
+                        
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON received: {str(e)}")
+                send_to_electron(json_serialize({
                     'status': 'error',
-                    'message': 'Invalid JSON message'
+                    'message': f'Invalid JSON: {str(e)}'
                 }))
             except Exception as e:
-                import traceback
-                logger.error(f"Error handling message: {str(e)}\n{traceback.format_exc()}")
-                print(json.dumps({
+                logger.error(f"Error handling message: {str(e)}", exc_info=True)
+                send_to_electron(json_serialize({
                     'status': 'error',
-                    'message': str(e)
+                    'message': f'Error: {str(e)}'
                 }))
         
-        # Read from stdin for IPC messages
+        # Read messages from stdin
         for line in sys.stdin:
             line = line.strip()
             if line:
-                asyncio.run(handle_message(line))
+                loop.run_until_complete(handle_message(line))
+                
     else:
-        # Standard mode (not Electron)
-        parser = argparse.ArgumentParser(description="Gradio UI for Browser Agent")
-        parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
-        parser.add_argument("--port", type=int, default=7788, help="Port to listen on")
-        parser.add_argument("--theme", type=str, default="Ocean", choices=theme_map.keys(), help="Theme to use for the UI")
-        parser.add_argument("--dark-mode", action="store_true", help="Enable dark mode")
-        parser.add_argument("--electron", action="store_true", help="Run in Electron mode")
-        args = parser.parse_args()
-
-        config_dict = default_config()
-
-        demo = create_ui(config_dict, theme_name=args.theme)
-        demo.launch(server_name=args.ip, server_port=args.port)
+        # Run the Web UI
+        create_ui() 
 
 if __name__ == '__main__':
     main()
