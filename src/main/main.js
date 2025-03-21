@@ -52,10 +52,21 @@ function startPythonApi() {
   // Options for the Python shell
   const options = {
     mode: 'text',
-    pythonPath: process.platform === 'win32' ? 'C:\\Users\\PC\\AppData\\Local\\Programs\\Python\\Python313\\python.exe' : 'python3', // Use full path to system Python
+    pythonPath: process.platform === 'win32' ? 'python' : 'python3', // Use python or python3 instead of full path
     pythonOptions: ['-u'], // unbuffered output
     scriptPath: pythonPath,
-    args: ['--electron'] // Add the --electron flag
+    args: ['--electron'], // Add the --electron flag
+    env: {
+      ...process.env,
+      // Set Chrome path for Windows or detect based on platform
+      CHROME_PATH: process.platform === 'win32' ? 
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' : 
+        (process.platform === 'darwin' ? 
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 
+          '/usr/bin/google-chrome'),
+      // Set CDP port for browser debugging
+      CHROME_DEBUGGING_PORT: '9222'
+    }
   };
 
   // Create a new PythonShell instance instead of using run

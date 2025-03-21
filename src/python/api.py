@@ -293,6 +293,9 @@ async def run_org_agent(
         chrome_path = None
         extra_chromium_args = [f"--window-size={window_w},{window_h}"]
         
+        # Log the browser configuration
+        logger.info(f"Browser config - use_own_browser: {use_own_browser}, headless: {headless}, chrome_cdp: {chrome_cdp}")
+        
         # Configure CDP
         if chrome_cdp:
             # Use CDP connection (existing browser)
@@ -305,55 +308,102 @@ async def run_org_agent(
             # Check if we should use the user's Chrome
             if use_own_browser:
                 logger.info("Using user's Chrome browser")
-                extra_chromium_args += ["--remote-debugging-port=0"]
+                
+                # Add remote debugging if CDP URL is not provided
+                debug_port = os.getenv("CHROME_DEBUGGING_PORT", "9222")
+                extra_chromium_args += [f"--remote-debugging-port={debug_port}"]
+                logger.info(f"Added remote debugging on port {debug_port}")
+                
                 chrome_user_data = os.getenv("CHROME_USER_DATA", None)
                 if chrome_user_data:
                     extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
+                    logger.info(f"Using Chrome user data dir: {chrome_user_data}")
+                
+                # Get Chrome path from environment
+                chrome_path = os.getenv("CHROME_PATH", None)
+                if chrome_path:
+                    logger.info(f"Using Chrome path: {chrome_path}")
             else:
                 chrome_path = None
                 logger.info("Using packaged Chrome browser")
         
-        controller = Controller()
+        try:
+            # Import Controller here to avoid circular imports
+            from browser_use.controller.controller import Controller
+            controller = Controller()
+            logger.info("Successfully created controller")
+        except Exception as e:
+            logger.error(f"Failed to create controller: {str(e)}")
+            raise Exception(f"Failed to create controller: {str(e)}")
         
-        # Initialize global browser if needed
-        if (_global_browser is None) or (cdp_url and cdp_url != ""):
-            logger.info("Creating browser instance")
-            _global_browser = Browser(
-                config=BrowserConfig(
-                    headless=headless,
-                    disable_security=disable_security,
-                    cdp_url=cdp_url,
-                    chrome_instance_path=chrome_path,
-                    extra_chromium_args=extra_chromium_args,
-                )
-            )
+        # Check if browser needs to be initialized
+        need_new_browser = (_global_browser is None) or (cdp_url and cdp_url != "")
         
-        if (_global_browser_context is None) or (cdp_url and cdp_url != ""):
-            logger.info("Creating browser context")
-            _global_browser_context = await _global_browser.new_context(
-                config=BrowserContextConfig(
-                    trace_path=save_trace_path if save_trace_path else None,
-                    save_recording_path=save_recording_path if save_recording_path else None,
-                    no_viewport=False,
-                    browser_window_size=BrowserContextWindowSize(
-                        width=window_w, height=window_h
-                    ),
+        if need_new_browser:
+            logger.info("Creating new browser instance with config:")
+            logger.info(f"  Headless: {headless}")
+            logger.info(f"  Disable security: {disable_security}")
+            logger.info(f"  CDP URL: {cdp_url}")
+            logger.info(f"  Chrome path: {chrome_path}")
+            logger.info(f"  Extra args: {extra_chromium_args}")
+            
+            try:
+                _global_browser = Browser(
+                    config=BrowserConfig(
+                        headless=headless,
+                        disable_security=disable_security,
+                        cdp_url=cdp_url,
+                        chrome_instance_path=chrome_path,
+                        extra_chromium_args=extra_chromium_args,
+                    )
                 )
-            )
+                logger.info("Successfully created browser instance")
+            except Exception as e:
+                logger.error(f"Failed to create browser: {str(e)}")
+                raise Exception(f"Failed to launch browser: {str(e)}")
+        
+        need_new_context = (_global_browser_context is None) or (cdp_url and cdp_url != "")
+        
+        if need_new_context:
+            logger.info("Creating new browser context with config:")
+            logger.info(f"  Trace path: {save_trace_path}")
+            logger.info(f"  Recording path: {save_recording_path}")
+            logger.info(f"  Window size: {window_w}x{window_h}")
+            
+            try:
+                _global_browser_context = await _global_browser.new_context(
+                    config=BrowserContextConfig(
+                        trace_path=save_trace_path if save_trace_path else None,
+                        save_recording_path=save_recording_path if save_recording_path else None,
+                        no_viewport=False,
+                        browser_window_size=BrowserContextWindowSize(
+                            width=window_w, height=window_h
+                        ),
+                    )
+                )
+                logger.info("Successfully created browser context")
+            except Exception as e:
+                logger.error(f"Failed to create browser context: {str(e)}")
+                raise Exception(f"Failed to create browser context: {str(e)}")
 
         # Create and run agent
         if _global_agent is None:
             logger.info("Creating agent")
-            _global_agent = Agent(
-                task=task,
-                use_vision=use_vision,
-                llm=llm,
-                browser=_global_browser,
-                browser_context=_global_browser_context,
-                controller=controller,
-                max_actions_per_step=max_actions_per_step,
-                tool_calling_method=tool_calling_method
-            )
+            try:
+                _global_agent = Agent(
+                    task=task,
+                    use_vision=use_vision,
+                    llm=llm,
+                    browser=_global_browser,
+                    browser_context=_global_browser_context,
+                    controller=controller,
+                    max_actions_per_step=max_actions_per_step,
+                    tool_calling_method=tool_calling_method
+                )
+                logger.info("Successfully created agent")
+            except Exception as e:
+                logger.error(f"Failed to create agent: {str(e)}")
+                raise Exception(f"Failed to create agent: {str(e)}")
             
         logger.info(f"Running agent with max_steps={max_steps}")
         history = await _global_agent.run(max_steps=max_steps)
@@ -376,19 +426,27 @@ async def run_org_agent(
         return final_result, errors, model_actions, model_thoughts, trace_file.get('.zip'), history_file
     except Exception as e:
         import traceback
-        traceback.print_exc()
-        errors = str(e) + "\n" + traceback.format_exc()
-        return '', errors, '', '', None, None
+        error_trace = traceback.format_exc()
+        logger.error(f"Error in run_org_agent: {str(e)}\n{error_trace}")
+        return '', f"Error: {str(e)}\n{error_trace}", '', '', None, None
     finally:
         _global_agent = None
         # Handle cleanup based on persistence configuration
         if not keep_browser_open:
             if _global_browser_context:
-                await _global_browser_context.close()
+                try:
+                    await _global_browser_context.close()
+                    logger.info("Closed browser context")
+                except Exception as e:
+                    logger.error(f"Error closing browser context: {str(e)}")
                 _global_browser_context = None
 
             if _global_browser:
-                await _global_browser.close()
+                try:
+                    await _global_browser.close()
+                    logger.info("Closed browser")
+                except Exception as e:
+                    logger.error(f"Error closing browser: {str(e)}")
                 _global_browser = None
 
 async def run_custom_agent(
@@ -417,49 +475,97 @@ async def run_custom_agent(
         _global_agent_state.clear_stop()
 
         extra_chromium_args = [f"--window-size={window_w},{window_h}"]
+        
+        # Initialize chrome_path and cdp_url
+        chrome_path = None
         cdp_url = chrome_cdp
+        
+        # Log the browser configuration
+        logger.info(f"Browser config - use_own_browser: {use_own_browser}, headless: {headless}, chrome_cdp: {chrome_cdp}")
+        
         if use_own_browser:
+            # Get Chrome CDP URL from environment variable or parameter
             cdp_url = os.getenv("CHROME_CDP", chrome_cdp)
-
+            logger.info(f"Using CDP URL: {cdp_url}")
+            
+            # Get Chrome path from environment 
             chrome_path = os.getenv("CHROME_PATH", None)
             if chrome_path == "":
                 chrome_path = None
+            
+            if chrome_path:
+                logger.info(f"Using Chrome path: {chrome_path}")
+            
+            # Get Chrome user data directory
             chrome_user_data = os.getenv("CHROME_USER_DATA", None)
             if chrome_user_data:
                 extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
+                logger.info(f"Using Chrome user data dir: {chrome_user_data}")
+                
+            # Add remote debugging if CDP URL is not provided
+            if not cdp_url:
+                debug_port = os.getenv("CHROME_DEBUGGING_PORT", "9222")
+                debug_host = os.getenv("CHROME_DEBUGGING_HOST", "localhost")
+                extra_chromium_args += [f"--remote-debugging-port={debug_port}"]
+                logger.info(f"Added remote debugging on port {debug_port}")
         else:
-            chrome_path = None
+            logger.info("Using packaged Chrome browser")
 
         controller = CustomController()
-
-        # Initialize global browser if needed
-        #if chrome_cdp not empty string nor None
-        if ((_global_browser is None) or (cdp_url and cdp_url != "" and cdp_url != None)) :
-            _global_browser = CustomBrowser(
-                config=BrowserConfig(
-                    headless=headless,
-                    disable_security=disable_security,
-                    cdp_url=cdp_url,
-                    chrome_instance_path=chrome_path,
-                    extra_chromium_args=extra_chromium_args,
+        
+        # Check if browser needs to be initialized
+        need_new_browser = (_global_browser is None) or (cdp_url and cdp_url != "" and cdp_url != None)
+        
+        if need_new_browser:
+            logger.info("Creating new browser instance with config:")
+            logger.info(f"  Headless: {headless}")
+            logger.info(f"  Disable security: {disable_security}")
+            logger.info(f"  CDP URL: {cdp_url}")
+            logger.info(f"  Chrome path: {chrome_path}")
+            logger.info(f"  Extra args: {extra_chromium_args}")
+            
+            try:
+                _global_browser = CustomBrowser(
+                    config=BrowserConfig(
+                        headless=headless,
+                        disable_security=disable_security,
+                        cdp_url=cdp_url,
+                        chrome_instance_path=chrome_path,
+                        extra_chromium_args=extra_chromium_args,
+                    )
                 )
-            )
+                logger.info("Successfully created browser instance")
+            except Exception as e:
+                logger.error(f"Failed to create browser: {str(e)}")
+                raise Exception(f"Failed to launch browser: {str(e)}")
 
-        if (_global_browser_context is None  or (chrome_cdp and cdp_url != "" and cdp_url != None)):
-            _global_browser_context = await _global_browser.new_context(
-                config=BrowserContextConfig(
-                    trace_path=save_trace_path if save_trace_path else None,
-                    save_recording_path=save_recording_path if save_recording_path else None,
-                    no_viewport=False,
-                    browser_window_size=BrowserContextWindowSize(
-                        width=window_w, height=window_h
-                    ),
+        need_new_context = (_global_browser_context is None or (cdp_url and cdp_url != "" and cdp_url != None))
+        
+        if need_new_context:
+            logger.info("Creating new browser context with config:")
+            logger.info(f"  Trace path: {save_trace_path}")
+            logger.info(f"  Recording path: {save_recording_path}")
+            logger.info(f"  Window size: {window_w}x{window_h}")
+            
+            try:
+                _global_browser_context = await _global_browser.new_context(
+                    config=BrowserContextConfig(
+                        trace_path=save_trace_path if save_trace_path else None,
+                        save_recording_path=save_recording_path if save_recording_path else None,
+                        no_viewport=False,
+                        browser_window_size=BrowserContextWindowSize(
+                            width=window_w, height=window_h
+                        ),
+                    )
                 )
-            )
-
+                logger.info("Successfully created browser context")
+            except Exception as e:
+                logger.error(f"Failed to create browser context: {str(e)}")
+                raise Exception(f"Failed to create browser context: {str(e)}")
 
         # Create and run agent
         if _global_agent is None:
+            logger.info("Creating agent")
             _global_agent = CustomAgent(
                 task=task,
                 add_infos=add_infos,
@@ -473,10 +579,14 @@ async def run_custom_agent(
                 max_actions_per_step=max_actions_per_step,
                 tool_calling_method=tool_calling_method
             )
+        
+        logger.info(f"Running agent with max_steps={max_steps}")
         history = await _global_agent.run(max_steps=max_steps)
+        logger.info("Agent run completed successfully")
 
         history_file = os.path.join(save_agent_history_path, f"{_global_agent.agent_id}.json")
         _global_agent.save_history(history_file)
+        logger.info(f"Saved agent history to {history_file}")
 
         final_result = history.final_result()
         errors = history.errors()
@@ -488,19 +598,27 @@ async def run_custom_agent(
         return final_result, errors, model_actions, model_thoughts, trace_file.get('.zip'), history_file
     except Exception as e:
         import traceback
-        traceback.print_exc()
-        errors = str(e) + "\n" + traceback.format_exc()
-        return '', errors, '', '', None, None
+        error_trace = traceback.format_exc()
+        logger.error(f"Error in run_custom_agent: {str(e)}\n{error_trace}")
+        return '', f"Error: {str(e)}\n{error_trace}", '', '', None, None
     finally:
         _global_agent = None
         # Handle cleanup based on persistence configuration
         if not keep_browser_open:
             if _global_browser_context:
-                await _global_browser_context.close()
+                try:
+                    await _global_browser_context.close()
+                    logger.info("Closed browser context")
+                except Exception as e:
+                    logger.error(f"Error closing browser context: {str(e)}")
                 _global_browser_context = None
 
             if _global_browser:
-                await _global_browser.close()
+                try:
+                    await _global_browser.close()
+                    logger.info("Closed browser")
+                except Exception as e:
+                    logger.error(f"Error closing browser: {str(e)}")
                 _global_browser = None
 
 async def run_with_stream(
